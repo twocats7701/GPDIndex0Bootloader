@@ -36,7 +36,6 @@ contract GPDIndex0Bootloader is ReentrancyGuard, Ownable {
     // Events
     event TokenPurchased(address indexed token, uint256 amount, string dex);
     event LiquidityAdded(address indexed lpToken, address token, uint256 amount, string dex);
-    event LPCreated(string pair);
     event BootstrapTriggered();
     event TestModeToggled(bool isTestRun);
     event LPWhitelisted(address lpToken);
@@ -60,12 +59,20 @@ contract GPDIndex0Bootloader is ReentrancyGuard, Ownable {
     bool public triggered = false;
     bool public basedChad = false;
 
+    address public dao;
+
+    uint256 public constant BASED_CHAD_START = 1754611201; // 08 Aug 2025 00:00:01 GMT
+
     uint256 public bootstrapThreshold = 88.8 ether;
     mapping(address => bool) public acceptedLPs;
 
     uint256 public buySlippageBps = 9500;
     uint256 public liquiditySlippageBps = 9500;
 
+    modifier onlyGovernance() {
+        require(msg.sender == owner() || msg.sender == dao, "Not authorized");
+        _;
+    }
 
     receive() external payable {}
     fallback() external payable {}
@@ -106,6 +113,11 @@ contract GPDIndex0Bootloader is ReentrancyGuard, Ownable {
         governanceEnabled = enabled;
     }
 
+    function setDao(address _dao) external onlyOwner {
+        require(_dao != address(0), "DAO address cannot be zero");
+        dao = _dao;
+    }
+
     function setTestRun(bool value) external onlyOwner {
         isTestRun = value;
         emit TestModeToggled(value);
@@ -122,15 +134,21 @@ contract GPDIndex0Bootloader is ReentrancyGuard, Ownable {
         liquiditySlippageBps = _liquiditySlippageBps;
     }
 
-    function whitelistLP(address tokenA, address tokenB, address lp) external {
-        require(governanceEnabled || msg.sender == owner(), "Not authorized");
-        require(factory.getPair(tokenA, tokenB) == lp, "LP mismatch");
+    function whitelistLP(address tokenA, address tokenB, address lp) external onlyGovernance {
+        require(tokenA != address(0), "Token A address cannot be zero");
+        require(tokenB != address(0), "Token B address cannot be zero");
+        require(lp != address(0), "LP address cannot be zero");
+
+        address pair = factory.getPair(tokenA, tokenB);
+        require(pair != address(0), "Pair does not exist");
+        require(pair == lp, "LP mismatch");
+
         acceptedLPs[lp] = true;
         emit LPWhitelisted(lp);
     }
 
-    function unwhitelistLP(address lp) external {
-        require(governanceEnabled || msg.sender == owner(), "Not authorized");
+    function unwhitelistLP(address lp) external onlyGovernance {
+        require(lp != address(0), "LP address cannot be zero");
         acceptedLPs[lp] = false;
         emit LPUnwhitelisted(lp);
     }
@@ -155,7 +173,7 @@ contract GPDIndex0Bootloader is ReentrancyGuard, Ownable {
     }
 
     function activateBasedChad() external nonReentrant {
-        require(block.timestamp >= 1754611201, "Too early for based chad"); // 08 08 2025 00:00:01 GMT
+        require(block.timestamp >= BASED_CHAD_START, "Too early for based chad");
         basedChad = true;
         emit BasedChadActivated(msg.sender);
         _triggerBootstrap();
@@ -190,8 +208,7 @@ contract GPDIndex0Bootloader is ReentrancyGuard, Ownable {
         require(!triggered, "Already triggered");
         require(
             address(this).balance >= bootstrapThreshold,
-            "AVAX balance below bootstrap threshold"
-
+            "Balance below bootstrap threshold"
         );
 
         triggered = true;
