@@ -32,6 +32,7 @@ contract GPDIndex0Bootloader {
     using SafeERC20 for IERC20;
 
     // Events
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event TokenPurchased(address indexed token, uint256 amount, string dex);
     event LiquidityAdded(address indexed lpToken, address token, uint256 amount, string dex);
     event LPCreated(string pair);
@@ -96,7 +97,9 @@ contract GPDIndex0Bootloader {
 
     function transferOwnership(address newOwner) external onlyOwner {
         require(newOwner != address(0), "New owner cannot be zero address");
+        address previousOwner = owner;
         owner = newOwner;
+        emit OwnershipTransferred(previousOwner, newOwner);
     }
 
     function setGovernanceEnabled(bool enabled) external onlyOwner {
