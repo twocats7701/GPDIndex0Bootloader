@@ -47,7 +47,6 @@ contract GPDIndex0Bootloader {
     IArenaBondingCurve public twocatsBond;
     IArenaBondingCurve public gerzaBond;
     IRouter public pangolinRouter;
-    IRouter public traderJoeRouter;
     IFactory public factory;
 
     uint256 public emissionsPerEpoch;
@@ -84,9 +83,8 @@ contract GPDIndex0Bootloader {
         gerzaBond = IArenaBondingCurve(_gerzaBond);
     }
 
-    function setRouterAddresses(address _pangolin, address _traderJoe, address _factory) external onlyOwner {
+    function setRouterAddresses(address _pangolin, address _factory) external onlyOwner {
         pangolinRouter = IRouter(_pangolin);
-        traderJoeRouter = IRouter(_traderJoe);
         factory = IFactory(_factory);
     }
 
