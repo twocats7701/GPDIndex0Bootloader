@@ -190,7 +190,8 @@ contract GPDIndex0Bootloader is ReentrancyGuard, Ownable {
         require(!triggered, "Already triggered");
         require(
             address(this).balance >= bootstrapThreshold,
-            "Balance below bootstrap threshold"
+            "AVAX balance below bootstrap threshold"
+
         );
 
         triggered = true;
