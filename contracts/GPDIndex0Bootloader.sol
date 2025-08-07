@@ -3,6 +3,7 @@ pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
 interface IRouter {
     function WAVAX() external view returns (address);
@@ -28,7 +29,7 @@ interface IFactory {
     function getPairCreator(address pair) external view returns (address);
 }
 
-contract GPDIndex0Bootloader {
+contract GPDIndex0Bootloader is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     // Events
@@ -39,6 +40,7 @@ contract GPDIndex0Bootloader {
     event TestModeToggled(bool isTestRun);
     event LPWhitelisted(address lpToken);
     event BasedChadActivated(address activator);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
     IERC20 public twocatsToken;
     IERC20 public gerzaToken;
@@ -96,7 +98,9 @@ contract GPDIndex0Bootloader {
 
     function transferOwnership(address newOwner) external onlyOwner {
         require(newOwner != address(0), "New owner cannot be zero address");
+        address oldOwner = owner;
         owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
     }
 
     function setGovernanceEnabled(bool enabled) external onlyOwner {
@@ -119,7 +123,7 @@ contract GPDIndex0Bootloader {
         emit LPWhitelisted(lp);
     }
 
-    function activateBasedChad() external {
+    function activateBasedChad() external nonReentrant {
         require(block.timestamp >= 1754611201, "Too early for based chad"); // 08 08 2025 00:00:01 GMT
         basedChad = true;
         emit BasedChadActivated(msg.sender);
@@ -139,7 +143,7 @@ contract GPDIndex0Bootloader {
         return (false, "Bootstrap incomplete or LPs not verified");
     }
 
-    function triggerBootstrap() external onlyOwner {
+    function triggerBootstrap() external onlyOwner nonReentrant {
         require(!basedChad, "BasedChad activated, bootstrap disabled");
         _triggerBootstrap();
     }
@@ -171,8 +175,10 @@ contract GPDIndex0Bootloader {
         uint256 twocatsBalance = twocatsToken.balanceOf(address(this));
         uint256 gerzaBalance = gerzaToken.balanceOf(address(this));
 
-        IERC20(address(twocatsToken)).safeApprove(address(pangolinRouter), twocatsBalance);
-        IERC20(address(gerzaToken)).safeApprove(address(pangolinRouter), gerzaBalance);
+        IERC20(address(twocatsToken)).safeApprove(address(pangolinRouter), 0);
+        IERC20(address(twocatsToken)).safeIncreaseAllowance(address(pangolinRouter), twocatsBalance);
+        IERC20(address(gerzaToken)).safeApprove(address(pangolinRouter), 0);
+        IERC20(address(gerzaToken)).safeIncreaseAllowance(address(pangolinRouter), gerzaBalance);
 
         try pangolinRouter.addLiquidityAVAX{value: avaxPerToken}(
             address(twocatsToken),
