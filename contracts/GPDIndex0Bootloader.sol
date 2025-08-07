@@ -150,7 +150,10 @@ contract GPDIndex0Bootloader is ReentrancyGuard {
 
     function _triggerBootstrap() internal {
         require(!triggered, "Already triggered");
-        require(address(this).balance > 0, "No AVAX balance");
+        require(
+            address(this).balance >= bootstrapThreshold,
+            "Balance below bootstrap threshold"
+        );
 
         triggered = true;
         emit BootstrapTriggered();
