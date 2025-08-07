@@ -152,17 +152,22 @@ contract GPDIndex0Bootloader {
         emit BootstrapTriggered();
 
         uint256 gasReserve = address(this).balance * 5 / 100;
-        uint256 amountToUse = address(this).balance - gasReserve;
-        uint256 avaxPerToken = amountToUse / 2;
+        uint256 totalToUse = address(this).balance - gasReserve;
 
-        try twocatsBond.buy{value: avaxPerToken}() {
-            emit TokenPurchased(address(twocatsToken), avaxPerToken, "Arena");
+        uint256 buyReserve = totalToUse / 2;
+        uint256 liquidityReserve = totalToUse - buyReserve;
+
+        uint256 avaxPerBuy = buyReserve / 2;
+        uint256 avaxPerLiquidity = liquidityReserve / 2;
+
+        try twocatsBond.buy{value: avaxPerBuy}() {
+            emit TokenPurchased(address(twocatsToken), avaxPerBuy, "Arena");
         } catch {
             revert("TWOCATS buy failed");
         }
 
-        try gerzaBond.buy{value: avaxPerToken}() {
-            emit TokenPurchased(address(gerzaToken), avaxPerToken, "Arena");
+        try gerzaBond.buy{value: avaxPerBuy}() {
+            emit TokenPurchased(address(gerzaToken), avaxPerBuy, "Arena");
         } catch {
             revert("GERZA buy failed");
         }
@@ -174,7 +179,7 @@ contract GPDIndex0Bootloader {
         IERC20(address(twocatsToken)).safeApprove(address(pangolinRouter), twocatsBalance);
         IERC20(address(gerzaToken)).safeApprove(address(pangolinRouter), gerzaBalance);
 
-        try pangolinRouter.addLiquidityAVAX{value: avaxPerToken}(
+        try pangolinRouter.addLiquidityAVAX{value: avaxPerLiquidity}(
             address(twocatsToken),
             twocatsBalance,
             1,
@@ -189,7 +194,7 @@ contract GPDIndex0Bootloader {
             revert("TWOCATS LP creation failed");
         }
 
-        try pangolinRouter.addLiquidityAVAX{value: avaxPerToken}(
+        try pangolinRouter.addLiquidityAVAX{value: avaxPerLiquidity}(
             address(gerzaToken),
             gerzaBalance,
             1,
