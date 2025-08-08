@@ -1,6 +1,12 @@
 # GPD Index 0 Bootloader & Yield System
 
-This repository contains a Hardhat project that bootstraps the **GPD Index 0** ecosystem and implements a suite of yield vaults, strategies and governance contracts.
+The GPD Index 0 protocol establishes a full-stack yield and governance ecosystem on Avalanche. A dedicated bootloader purchases the initial TWOCATS and GERZA supply through bonding curves, seeds DEX liquidity, and sets emission parameters before handing control to on-chain governance after the first epoch
+
+User deposits flow into an ERC‑4626 vault that charges a decaying withdrawal fee and a 5 % performance fee on harvested rewards. Multiple pluggable strategies manage those assets, including BENQI lending markets, MasterChef-style LP farming, Blackhole DEX pools, and a simple staking module for tests
+
+Boosting logic aggregates TWOCATS and GERZA stakes to deliver vote-escrow–weighted rewards through a boost vault and gauge system. Governance is anchored by an emission schedule, a time-locked governance token, and a non-transferable vote-escrow token with linear decay
+
+The architecture is designed for modular deployment across EVM chains, with Hardhat configuration and scripts prepared for Avalanche mainnet and Fuji testnet out of the box.
 
 ## Major Contracts
 
