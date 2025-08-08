@@ -145,9 +145,6 @@ The deployment script currently deploys:
 
 `VaporDexStrategy` stakes LP tokens in a Vapor Dex farm and compounds rewards back into the LP token. The contract accepts the farm's `pid`, reward token, and router addresses on deployment, making it compatible with other Uniswap V2 style DEXs such as Pangolin.
 
-=======
-Modify the script with real token, LP, farm and router addresses before production use.
-=======
 
 ## License
 
