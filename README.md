@@ -14,17 +14,26 @@ This repository contains a Hardhat project that bootstraps the **GPD Index 0** e
 * Applies withdrawal fees that decay over four weeks and harvests strategy rewards with a 5% performance fee.
 * Optional `autoCompoundEnabled` flag runs `compound` after every deposit or withdrawal.
 
+### Rebalancer
+* Moves assets between two `IYieldStrategy` implementations when a target strategy offers a higher APR.
+
 ### Strategies
-* **BenqiStrategy** – Supplies assets to BENQI lending markets and compounds QI rewards back into the underlying.
-* **GPDIndex0LpStrategy** – Stakes GPDINDEX0 LP tokens in MasterChef style farms and auto‑compounds farm rewards.
-* **BlackholeDexStrategy** – Deposits assets into Blackhole DEX pools and forwards claimed rewards to the vault.
-* **SimpleStakingStrategy** – Lightweight strategy used for simulations and testing scenarios.
-* **VaporDexStrategy** – Stakes LP tokens in VaporDex or compatible farms and compounds rewards back into the vault.
-* **AaveV3Strategy** – Supplies assets to Aave v3 lending pools, harvests protocol incentives and can optionally leverage positions using flash loans.
+ * **BenqiStrategy** – Supplies assets to BENQI lending markets and compounds QI rewards back into the underlying. Includes `emergencyWithdraw` to return all supplied assets and rewards directly to the vault without swaps.
+ * **GPDIndex0LpStrategy** – Stakes GPDINDEX0 LP tokens in MasterChef style farms and auto‑compounds farm rewards. Provides `emergencyWithdraw` for pulling staked LP and reward tokens back to the vault.
+ * **BlackholeDexStrategy** – Deposits assets into Blackhole DEX pools and forwards claimed rewards to the vault. An `emergencyWithdraw` function lets the owner recover all deposits and rewards to the vault.
+ * **SimpleStakingStrategy** – Lightweight strategy used for simulations and testing scenarios.
+ * **VaporDexStrategy** – Stakes LP tokens in VaporDex or compatible farms and compounds rewards back into the vault. Supports `emergencyWithdraw` to rescue staked LP and rewards without performing swaps.
+ * **AaveV3Strategy** – Supplies assets to Aave v3 lending pools, harvests protocol incentives and can optionally leverage positions using flash loans.
 
 ### Boosting & Gauges
 * **GPDBoostVault** – Aggregates TWOCATS and GERZA stakes, routes them to strategies and distributes rewards boosted by vote‑escrow balances. When `autoCompoundEnabled` is true the vault harvests rewards after each deposit or withdrawal.
 * **GPDGauge** – Gauge contract that attaches to Blackhole pools and distributes rewards proportional to ve voting power.
+
+
+### Booster Flow & Emergency Exit
+The protocol interacts with Platypus PTP farms exclusively through external boosters such as Vector and Echidna. Treasury funds are never held as raw PTP or vePTP; deposits are routed to boosters that stake on the protocol's behalf.
+
+Booster positions remain intentionally tiny and must be continuously monitored. Off-chain watchers should track booster health and governance changes. If a booster is compromised or a pool is exploited, use `scripts/emergency-exit.js` to trigger `emergencyWithdraw` and unwind exposure. See [docs/booster-flow.md](docs/booster-flow.md) for a full walkthrough.
 
 ### Governance & Tokens
 * **GPDIndex0EmissionSchedule** – Stores emission constants and weighting multipliers for governance.
@@ -36,6 +45,24 @@ This repository contains a Hardhat project that bootstraps the **GPD Index 0** e
 * **TipVault** – Pays registered keepers a configurable token tip with cooldown enforcement.
 * **RewardEscrow** – Escrows reward tokens with timelocked vesting schedules.
 * **DAOTreasury** – Holds DAO funds and allows operators to fund TipVault and RewardEscrow.
+
+### lsGMX Vault
+The `LsGmxVault` accepts GMX deposits and stakes them via `GmxStakingStrategy`. Users
+receive non‑rebasing shares whose price per share (PPS) increases as rewards are
+harvested. Withdrawals burn shares and return the underlying GMX. Off‑chain
+harvester agents call the on‑chain `GmxHarvester` which compounds rewards across
+configured vaults. A complementary APR optimizer script monitors 7/30‑day trailing
+APR and emits boost distributions via `GPDBoostVault` when yields fall below a
+target. Operators can deploy the harvester and optimizer with:
+
+```
+npx hardhat run scripts/harvester/gmxHarvester.ts --network <net>
+npx hardhat run scripts/optimizer/gmxAprOptimizer.ts --network <net>
+```
+
+Track PPS via `totalAssets()` and `totalSupply()` on the vault and calculate APR
+from historical reward deltas relative to TVL. The optimizer publishes APR metrics
+through events enabling dashboards to display current performance.
 
 
 ## Environment & Setup
@@ -140,6 +167,7 @@ ROUTER_ADDRESS=0x2222222222222222222222222222222222222222
 2. Approve the vault to transfer your LP tokens and call `deposit` to add liquidity.
 3. To exit, call `withdraw` to retrieve LP tokens and then `removeLiquidity` on the router.
 4. Vault owners can trigger `compound` to harvest farm rewards and reinvest them; claimed rewards accrue to vault depositors.
+5. In emergencies the owner may call `emergencyWithdraw()` to pull all staked LP and reward tokens back to the vault without performing swaps.
 
 ### Pangolin Compatibility
 
@@ -184,6 +212,8 @@ The deployment script currently deploys:
 ## Vapor Dex LP Strategy
 
 `VaporDexStrategy` stakes LP tokens in a Vapor Dex farm and compounds rewards back into the LP token. The contract accepts the farm's `pid`, reward token, and router addresses on deployment, making it compatible with other Uniswap V2 style DEXs such as Pangolin.
+
+An `emergencyWithdraw` function lets the owner recover all staked LP and reward tokens to the vault without swapping.
 
 =======
 Modify the script with real token, LP, farm and router addresses before production use.
@@ -249,6 +279,10 @@ Vaults can be configured to auto‑compound rewards after each deposit or withdr
 
 Example strategies for Platypus and Aave V3 can be deployed to diversify yield sources. Platypus pools supply high‑liquidity swaps, while the Aave V3 strategy may optionally draw a flash loan to open a leveraged deposit position before instantly repaying the loan. Flash‑loan hooks enable capital efficient loops without upfront liquidity.
 
+### Platypus Coverage Monitoring
+
+`PlatypusSwapRoute` queries on‑chain coverage ratios before executing swaps or booster deposits. If a pool’s coverage falls below a configurable threshold, the contract emits a `KillSwitchActivated` event and automatically disables Platypus routing. Coverage ratio checks and kill‑switch status are exposed through events so off‑chain dashboards can monitor pool health in real time.
+
 ### Risk Tiers & Keeper Settings
 
 Strategies are grouped into three risk tiers:
@@ -259,3 +293,9 @@ Strategies are grouped into three risk tiers:
 
 Tune keeper intervals based on on‑chain gas prices and the vault’s reward emission schedule. Always monitor strategy health and pause vaults via `emergencyWithdraw` if anomalies are detected.
 
+
+## Rebalancer Usage & Risks
+
+The standalone `Rebalancer` contract pulls funds from one strategy and pushes them into another when signalled APR values show a higher return. Vault owners invoke it through `GPDYieldVault0.rebalance`, supplying the source and destination strategies, the amount to move and their respective APRs. The call delegates to the rebalancer so strategy interactions still originate from the vault.
+
+**Risks:** Incorrect or manipulated APR inputs can shift assets into lower‑yielding or malicious strategies. Rebalancing also introduces additional gas costs and may be front‑run if APR data is public. Operators should verify APR sources and only rebalance when the projected gain outweighs execution costs.

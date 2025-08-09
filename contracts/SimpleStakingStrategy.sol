@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "./GPDYieldVault0.sol";
 
 /**
@@ -11,7 +12,8 @@ import "./GPDYieldVault0.sol";
  * @dev Simulates staking and auto-harvesting logic for GPDYieldVault0
  */
 
-contract SimpleStakingStrategy is Ownable, IYieldStrategy {
+contract SimpleStakingStrategy is Ownable, ReentrancyGuard, IYieldStrategy {
+    using SafeERC20 for IERC20;
 
     IERC20 public immutable token;
     address public vault;
@@ -36,22 +38,38 @@ contract SimpleStakingStrategy is Ownable, IYieldStrategy {
         token.safeApprove(vault, type(uint256).max);
     }
 
-    function deposit(uint256 amount) external onlyVault {
+    function _deposit(uint256 amount) internal {
         token.safeTransferFrom(msg.sender, address(this), amount);
         totalStaked += amount;
     }
 
-    function withdraw(uint256 amount) external onlyVault {
+    function deposit(uint256 amount) external onlyVault nonReentrant {
+        _deposit(amount);
+    }
+
+    function deposit(uint256 amount, uint256 /*slippageBpsOverride*/) public onlyVault nonReentrant {
+        _deposit(amount);
+    }
+
+    function _withdraw(uint256 amount) internal {
         require(amount <= totalStaked, "Insufficient balance");
         totalStaked -= amount;
         token.safeTransfer(vault, amount);
+    }
+
+    function withdraw(uint256 amount) external onlyVault nonReentrant {
+        _withdraw(amount);
+    }
+
+    function withdraw(uint256 amount, uint256 /*slippageBpsOverride*/) public onlyVault nonReentrant {
+        _withdraw(amount);
     }
 
     function totalAssets() external view returns (uint256) {
         return totalStaked + simulatedYield;
     }
 
-    function harvest(uint256 /*slippageBpsOverride*/) external onlyVault returns (uint256) {
+    function harvest(uint256 /*slippageBpsOverride*/) external onlyVault nonReentrant returns (uint256) {
         uint256 yield = simulatedYield;
         simulatedYield = 0;
         token.safeTransfer(vault, yield);

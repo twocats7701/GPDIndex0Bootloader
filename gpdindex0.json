@@ -1,0 +1,40 @@
+{
+  "title": "Emission Schedule - GPDINDEX0",
+  "notice": "Structured logic for emissions, epochs, and multipliers for vault incentives",
+  "emissionToken": {
+    "symbol": "GPDINDEX0",
+    "address": "0x0000000000000000000000000000000000000000"
+  },
+  "emissionParameters": {
+    "totalSupply": "1000000000000000000000000",
+    "epochDuration": 2592000,
+    "transferUnlockPercent": 10
+  },
+  "emissionLogic": {
+    "emissionStartsAfterGenesis": true,
+    "linearEmission": true,
+    "transferLockedInitial": true
+  },
+  "tokenMultipliers": [
+    { "name": "TWOCATS", "multiplierBps": 12700 },
+    { "name": "GERZA", "multiplierBps": 11400 },
+    { "name": "AVAX", "multiplierBps": 11100 },
+    { "name": "USDC", "multiplierBps": 10800 },
+    { "name": "USDT", "multiplierBps": 10800 }
+  ],
+  "earlyAvaxGlobalBonusBps": 12800,
+  "governance": {
+    "enabled": true,
+    "token": "GPDINDEX0",
+    "daoControls": [
+      "Vault upgrades",
+      "Fee exemption whitelists",
+      "Strategy allocation changes",
+      "DAO voting proposals"
+    ]
+  },
+  "futureEpochs": {
+    "enabled": true,
+    "tokenPattern": "GPDINDEX[n]"
+  }
+}

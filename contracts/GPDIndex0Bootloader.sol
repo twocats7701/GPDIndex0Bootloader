@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "./GPDINDEX0EmissionSchedule.sol";
+import "@openzeppelin/contracts/governance/TimelockController.sol";
+import "./GPDIndex0EmissionSchedule.sol";
+
+interface IPriceOracle {
+    function getPrice() external view returns (uint256);
+}
 
 interface IRouter {
     function WAVAX() external view returns (address);
@@ -31,6 +36,9 @@ interface IFactory {
     function getPairCreator(address pair) external view returns (address);
 }
 
+/// @title GPDIndex0 Bootloader
+/// @notice Handles initial bootstrap operations and governance configuration
+/// @dev Deploys liquidity, manages emission parameters and governs setup
 contract GPDIndex0Bootloader is ReentrancyGuard, Ownable {
     using SafeERC20 for IERC20;
 
@@ -43,6 +51,23 @@ contract GPDIndex0Bootloader is ReentrancyGuard, Ownable {
     event LPUnwhitelisted(address lpToken);
     event BasedChadActivated(address activator);
     event FundsWithdrawn(address indexed token, uint256 amount);
+    event DepositProcessed(address indexed from, uint256 amount, uint256 invested);
+    event ReserveUpdated(uint256 liquidReserve, uint256 investedReserve);
+    event SwapExecuted(
+        address indexed token,
+        uint256 amountIn,
+        uint256 amountOut,
+        uint256 price,
+        uint256 slippageBps
+    );
+    event LiquidityStaged(
+        address indexed token,
+        uint256 amountAVAX,
+        uint256 amountToken,
+        uint256 price,
+        uint256 slippageBps
+    );
+    event GovernanceTransferred(address indexed previousGovernance, address indexed newGovernance);
 
     IERC20 public twocatsToken;
     IERC20 public gerzaToken;
@@ -55,39 +80,61 @@ contract GPDIndex0Bootloader is ReentrancyGuard, Ownable {
     IFactory public factory;
 
     uint256 public emissionsPerEpoch;
+    uint256 public constant EPOCH_DURATION = 30 days;
     bool public governanceEnabled = false;
     bool public isTestRun = true;
     bool public triggered = false;
     bool public basedChad = false;
 
-    address public dao;
+    TimelockController public timelock;
+    address public governance;
+    bool public decentralizationInitiated = false;
 
     uint256 public constant BASED_CHAD_START = 1754611201; // 08 Aug 2025 00:00:01 GMT
 
-    uint256 public bootstrapThreshold = 88.8 ether;
+    uint256 public targetTVL = 88.8 ether;
     mapping(address => bool) public acceptedLPs;
 
-    uint256 public buySlippageBps = 9500;
-    uint256 public liquiditySlippageBps = 9500;
+    uint256 public maxPriceImpactBps = 500; // 5%
+    uint256 public maxSlippageBps = 500; // 5%
+
+    mapping(address => bool) public circuitBreakers;
+    mapping(address => address) public priceOracles;
+    mapping(address => uint256) public marketPrices;
+    mapping(address => uint256) public executionPrices;
+
+    uint256 public buyPortionBps = 5000;
+    uint256 public minLotSize = 1 ether;
+    uint256 public liquidReserve;
+    uint256 public investedReserve;
 
     uint256 public genesisTimestamp;
 
     modifier onlyGovernance() {
         if (!governanceEnabled &&
             genesisTimestamp > 0 &&
-            block.timestamp >= genesisTimestamp + GPDINDEX0EmissionSchedule.EPOCH_DURATION()
+            block.timestamp >= genesisTimestamp + EPOCH_DURATION
         ) {
             governanceEnabled = true;
         }
         require(governanceEnabled, "Governance not enabled");
-        require(msg.sender == owner() || msg.sender == dao, "Not authorized");
+        if (address(timelock) != address(0)) {
+            require(msg.sender == address(timelock), "Not authorized");
+        } else {
+            require(msg.sender == owner(), "Not authorized");
+        }
         _;
     }
 
     receive() external payable {}
     fallback() external payable {}
 
-    function setTokenAddresses(address _twocats, address _gerza, address _pussy, address _usdt) external onlyOwner {
+    /// @notice Configure token addresses used during bootstrap operations
+    /// @param _twocats TWOCATS token address
+    /// @param _gerza GERZA token address
+    /// @param _pussy PUSSY token address
+    /// @param _usdt USDT token address
+    function setTokenAddresses(address _twocats, address _gerza, address _pussy, address _usdt) external onlyGovernance {
         require(_twocats != address(0), "TWOCATS token address cannot be zero");
         require(_gerza != address(0), "GERZA token address cannot be zero");
         require(_pussy != address(0), "PUSSY token address cannot be zero");
@@ -98,14 +145,21 @@ contract GPDIndex0Bootloader is ReentrancyGuard, Ownable {
         usdtToken = IERC20(_usdt);
     }
 
-    function setBondingContracts(address _twocatsBond, address _gerzaBond) external onlyOwner {
+    /// @notice Set Arena bonding curve contracts for TWOCATS and GERZA
+    /// @param _twocatsBond Address of the TWOCATS bonding contract
+    /// @param _gerzaBond Address of the GERZA bonding contract
+    function setBondingContracts(address _twocatsBond, address _gerzaBond) external onlyGovernance {
         require(_twocatsBond != address(0), "TWOCATS bond address cannot be zero");
         require(_gerzaBond != address(0), "GERZA bond address cannot be zero");
         twocatsBond = IArenaBondingCurve(_twocatsBond);
         gerzaBond = IArenaBondingCurve(_gerzaBond);
     }
 
-    function setRouterAddresses(address _pangolin, address _traderJoe, address _factory) external onlyOwner {
+    /// @notice Update router and factory contract addresses
+    /// @param _pangolin Pangolin router address
+    /// @param _traderJoe TraderJoe router address
+    /// @param _factory DEX factory address
+    function setRouterAddresses(address _pangolin, address _traderJoe, address _factory) external onlyGovernance {
         require(_pangolin != address(0), "Pangolin router address cannot be zero");
         require(_traderJoe != address(0), "TraderJoe router address cannot be zero");
         require(_factory != address(0), "Factory address cannot be zero");
@@ -114,58 +168,140 @@ contract GPDIndex0Bootloader is ReentrancyGuard, Ownable {
         factory = IFactory(_factory);
     }
 
-    function setEmissionsPerEpoch(uint256 _amount) external onlyOwner {
+    /// @notice Set number of tokens emitted per epoch
+    /// @param _amount Amount of tokens to emit
+    function setEmissionsPerEpoch(uint256 _amount) external onlyGovernance {
         require(_amount > 0, "Emissions must be greater than zero");
         emissionsPerEpoch = _amount;
     }
 
+    /// @notice Manually toggle governance capability
+    /// @param enabled New governance state
     function setGovernanceEnabled(bool enabled) external onlyOwner {
         governanceEnabled = enabled;
     }
 
+    /// @notice Disable governance within a grace period after genesis
     function rollbackGovernance() external onlyOwner {
         require(
             block.timestamp <
                 genesisTimestamp +
-                2 * GPDINDEX0EmissionSchedule.EPOCH_DURATION(),
+                2 * EPOCH_DURATION,
             "Rollback period expired"
         );
         governanceEnabled = false;
     }
 
+    /// @notice Record the timestamp used to compute epochs
+    /// @param _genesisTimestamp Genesis timestamp in seconds
     function setGenesisTimestamp(uint256 _genesisTimestamp) external onlyOwner {
         require(_genesisTimestamp > 0, "Genesis timestamp must be > 0");
         genesisTimestamp = _genesisTimestamp;
     }
 
+    /// @notice Return the current epoch number
     function getCurrentEpoch() public view returns (uint256) {
         if (genesisTimestamp == 0 || block.timestamp < genesisTimestamp) {
             return 0;
         }
-        return (block.timestamp - genesisTimestamp) / GPDINDEX0EmissionSchedule.EPOCH_DURATION();
+        return (block.timestamp - genesisTimestamp) / EPOCH_DURATION;
     }
 
-    function setDao(address _dao) external onlyOwner {
-        require(_dao != address(0), "DAO address cannot be zero");
-        dao = _dao;
+    /// @notice Begin decentralization by setting timelock and governance addresses
+    /// @param _timelock Timelock controller address
+    /// @param _governance Governance contract address
+    function beginDecentralization(address payable _timelock, address _governance) external onlyOwner {
+        require(!decentralizationInitiated, "Decentralization already begun");
+        require(_timelock != address(0) && _governance != address(0), "Zero address");
+        timelock = TimelockController(_timelock);
+        address previousGovernance = governance;
+        governance = _governance;
+        decentralizationInitiated = true;
+        transferOwnership(_timelock);
+        emit GovernanceTransferred(previousGovernance, _governance);
     }
 
+    /// @notice Enable or disable test mode
+    /// @param value True to run in test mode
     function setTestRun(bool value) external onlyOwner {
         isTestRun = value;
         emit TestModeToggled(value);
     }
 
-    function setBootstrapThreshold(uint256 _amountInWei) external onlyOwner {
+    /// @notice Set target TVL required before final bootstrap
+    /// @param _amountInWei Target in wei
+    function setTargetTVL(uint256 _amountInWei) external onlyGovernance {
         require(_amountInWei > 0, "Threshold must be greater than 0");
-       bootstrapThreshold = _amountInWei;
+        targetTVL = _amountInWei;
     }
 
-    function setSlippageBps(uint256 _buySlippageBps, uint256 _liquiditySlippageBps) external onlyOwner {
-        require(_buySlippageBps <= 10000 && _liquiditySlippageBps <= 10000, "BPS too high");
-        buySlippageBps = _buySlippageBps;
-        liquiditySlippageBps = _liquiditySlippageBps;
+    /// @notice Set risk parameters for swaps
+    /// @param _maxPriceImpactBps Maximum allowed price impact in basis points
+    /// @param _maxSlippageBps Maximum allowed slippage in basis points
+    function setRiskParams(uint256 _maxPriceImpactBps, uint256 _maxSlippageBps) external onlyGovernance {
+        require(_maxPriceImpactBps <= 10000 && _maxSlippageBps <= 10000, "BPS too high");
+        maxPriceImpactBps = _maxPriceImpactBps;
+        maxSlippageBps = _maxSlippageBps;
     }
 
+    /// @notice Assign oracle address for a token
+    function setPriceOracle(address token, address oracle) external onlyGovernance {
+        require(token != address(0) && oracle != address(0), "Invalid address");
+        priceOracles[token] = oracle;
+    }
+
+    /// @notice Set quoted market price for a token (1e18 precision)
+    function setMarketPrice(address token, uint256 price) external onlyGovernance {
+        marketPrices[token] = price;
+    }
+
+    /// @notice Set execution price for a token (1e18 precision)
+    function setExecutionPrice(address token, uint256 price) external onlyGovernance {
+        executionPrices[token] = price;
+    }
+
+    /// @notice Toggle circuit breaker for a token
+    function setCircuitBreaker(address token, bool active) external onlyGovernance {
+        circuitBreakers[token] = active;
+    }
+
+    /// @notice Set portion of deposits routed to investments
+    /// @param _bps Basis points of deposit to convert
+    function setBuyPortionBps(uint256 _bps) external onlyGovernance {
+        require(_bps <= 10000, "BPS too high");
+        buyPortionBps = _bps;
+    }
+
+    /// @notice Set minimum lot size before conversion
+    /// @param _amount Lot size in wei
+    function setMinLotSize(uint256 _amount) external onlyGovernance {
+        minLotSize = _amount;
+    }
+
+    /// @notice Deposit AVAX into the bootloader
+    function deposit() external payable nonReentrant {
+        require(msg.value > 0, "Amount must be greater than zero");
+        liquidReserve += msg.value;
+
+        uint256 totalValue = liquidReserve + investedReserve;
+        uint256 desiredInvested = (totalValue * buyPortionBps) / 10000;
+        uint256 toInvest = desiredInvested > investedReserve ? desiredInvested - investedReserve : 0;
+
+        if (toInvest >= minLotSize && toInvest <= liquidReserve) {
+            _buyAndAddLiquidity(toInvest);
+        }
+
+        emit DepositProcessed(msg.sender, msg.value, toInvest);
+
+        if (!triggered && totalValue >= targetTVL) {
+            _triggerBootstrap();
+        }
+    }
+
+    /// @notice Approve an LP token for future operations
+    /// @param tokenA First token of the pair
+    /// @param tokenB Second token of the pair
+    /// @param lp LP token address
     function whitelistLP(address tokenA, address tokenB, address lp) external onlyGovernance {
         require(tokenA != address(0), "Token A address cannot be zero");
         require(tokenB != address(0), "Token B address cannot be zero");
@@ -179,13 +315,17 @@ contract GPDIndex0Bootloader is ReentrancyGuard, Ownable {
         emit LPWhitelisted(lp);
     }
 
+    /// @notice Remove an LP token from the whitelist
+    /// @param lp LP token address
     function unwhitelistLP(address lp) external onlyGovernance {
         require(lp != address(0), "LP address cannot be zero");
         acceptedLPs[lp] = false;
         emit LPUnwhitelisted(lp);
     }
 
-    function withdrawAVAX(uint256 amount) external onlyOwner nonReentrant {
+    /// @notice Withdraw AVAX from the contract to the owner
+    /// @param amount Amount of AVAX to withdraw
+    function withdrawAVAX(uint256 amount) external onlyGovernance nonReentrant {
         require(amount > 0, "Amount must be greater than zero");
         require(address(this).balance >= amount, "Insufficient AVAX balance");
 
@@ -195,7 +335,10 @@ contract GPDIndex0Bootloader is ReentrancyGuard, Ownable {
         emit FundsWithdrawn(address(0), amount);
     }
 
-    function withdrawToken(address token, uint256 amount) external onlyOwner nonReentrant {
+    /// @notice Withdraw an arbitrary ERC20 token to the owner
+    /// @param token Token address to withdraw
+    /// @param amount Amount of tokens to send
+    function withdrawToken(address token, uint256 amount) external onlyGovernance nonReentrant {
         require(token != address(0), "Token address cannot be zero");
         require(amount > 0, "Amount must be greater than zero");
 
@@ -204,6 +347,7 @@ contract GPDIndex0Bootloader is ReentrancyGuard, Ownable {
         emit FundsWithdrawn(token, amount);
     }
 
+    /// @notice Anyone can activate the based chad mode once the timestamp is reached
     function activateBasedChad() external nonReentrant {
         require(block.timestamp >= BASED_CHAD_START, "Too early for based chad");
         basedChad = true;
@@ -211,117 +355,71 @@ contract GPDIndex0Bootloader is ReentrancyGuard, Ownable {
         _triggerBootstrap();
     }
 
+    /// @notice Return whether bootstrap conditions have been met
+    /// @return ready True if bootstrap is complete
+    /// @return status Description of current state
     function getBootstrapStatus() public view returns (bool ready, string memory status) {
         if (!triggered && !basedChad) return (false, isTestRun ? "Waiting for test trigger" : "Waiting for admin trigger");
 
-        require(address(factory) != address(0), "Factory not set");
-        require(address(pangolinRouter) != address(0), "Pangolin router not set");
-
-        address twocatsAvaxLP = factory.getPair(address(twocatsToken), pangolinRouter.WAVAX());
-        address gerzaAvaxLP = factory.getPair(address(gerzaToken), pangolinRouter.WAVAX());
-
-        bool assetsBought = twocatsAvaxLP != address(0) && gerzaAvaxLP != address(0);
-        bool lpsWhitelisted = acceptedLPs[twocatsAvaxLP] && acceptedLPs[gerzaAvaxLP];
-
-        if (assetsBought && lpsWhitelisted) return (true, "Bootstrap complete and LPs accepted");
-        return (false, "Bootstrap incomplete or LPs not verified");
+        return (true, "Bootstrap complete");
     }
 
+    /// @notice Manually trigger the bootstrap sequence
     function triggerBootstrap() external onlyOwner nonReentrant {
         require(!basedChad, "BasedChad activated, bootstrap disabled");
+        require(liquidReserve + investedReserve >= targetTVL, "TVL below target");
         _triggerBootstrap();
     }
 
+    /// @dev Internal logic performing the bootstrap flow
     function _triggerBootstrap() internal {
-        require(address(twocatsBond) != address(0), "TWOCATS bond not set");
-        require(address(gerzaBond) != address(0), "GERZA bond not set");
-        require(address(pangolinRouter) != address(0), "Pangolin router not set");
-        require(address(factory) != address(0), "Factory not set");
-        require(address(twocatsToken) != address(0), "TWOCATS token not set");
-        require(address(gerzaToken) != address(0), "GERZA token not set");
-
         require(!triggered, "Already triggered");
-        require(
-            address(this).balance >= bootstrapThreshold,
-            "Balance below bootstrap threshold"
-        );
+
+        uint256 amount = liquidReserve;
+        if (amount > 0) {
+            _buyAndAddLiquidity(amount);
+        }
 
         triggered = true;
         emit BootstrapTriggered();
+    }
 
-        uint256 gasReserve = address(this).balance * 5 / 100;
-        uint256 totalToUse = address(this).balance - gasReserve;
+    /// @dev Convert AVAX reserves into protocol positions
+    function _buyAndAddLiquidity(uint256 amount) internal {
+        require(amount > 0, "Amount must be greater than zero");
+        require(liquidReserve >= amount, "Insufficient reserve");
 
-        uint256 buyReserve = totalToUse / 2;
-        uint256 liquidityReserve = totalToUse - buyReserve;
+        liquidReserve -= amount;
+        investedReserve += amount;
 
-        uint256 avaxPerBuy = buyReserve / 2;
-        uint256 avaxPerLiquidity = liquidityReserve / 2;
-
-        uint256 twocatsMinOut = twocatsBond.calculateBuyPrice(avaxPerBuy) * buySlippageBps / 10000;
-        uint256 gerzaMinOut = gerzaBond.calculateBuyPrice(avaxPerBuy) * buySlippageBps / 10000;
-
-        try twocatsBond.buy{value: avaxPerBuy}(twocatsMinOut) {
-            emit TokenPurchased(address(twocatsToken), avaxPerBuy, "Arena");
-        } catch {
-            revert("TWOCATS buy failed");
+        if (address(twocatsToken) != address(0)) {
+            _executeSwap(address(twocatsToken), amount);
         }
 
-        try gerzaBond.buy{value: avaxPerBuy}(gerzaMinOut) {
-            emit TokenPurchased(address(gerzaToken), avaxPerBuy, "Arena");
-        } catch {
-            revert("GERZA buy failed");
-        }
+        emit ReserveUpdated(liquidReserve, investedReserve);
+    }
 
-        address wavax = pangolinRouter.WAVAX();
-        uint256 twocatsBalance = twocatsToken.balanceOf(address(this));
-        uint256 gerzaBalance = gerzaToken.balanceOf(address(this));
+    function _executeSwap(address token, uint256 amountIn) internal {
+        require(!circuitBreakers[token], "Circuit breaker active");
+        address oracle = priceOracles[token];
+        require(oracle != address(0), "Oracle not set");
+        uint256 oraclePrice = IPriceOracle(oracle).getPrice();
+        uint256 marketPrice = marketPrices[token];
+        uint256 execPrice = executionPrices[token];
+        require(marketPrice > 0 && execPrice > 0, "Prices not set");
 
-        IERC20(address(twocatsToken)).safeApprove(address(pangolinRouter), 0);
-        IERC20(address(twocatsToken)).safeIncreaseAllowance(address(pangolinRouter), twocatsBalance);
-        IERC20(address(gerzaToken)).safeApprove(address(pangolinRouter), 0);
-        IERC20(address(gerzaToken)).safeIncreaseAllowance(address(pangolinRouter), gerzaBalance);
+        uint256 priceImpact = marketPrice > oraclePrice
+            ? (marketPrice - oraclePrice) * 10000 / oraclePrice
+            : (oraclePrice - marketPrice) * 10000 / oraclePrice;
+        require(priceImpact <= maxPriceImpactBps, "Price impact too high");
 
-        uint256 avaxMin = avaxPerLiquidity * liquiditySlippageBps / 10000;
+        uint256 slippage = execPrice > marketPrice
+            ? (execPrice - marketPrice) * 10000 / marketPrice
+            : (marketPrice - execPrice) * 10000 / marketPrice;
+        require(slippage <= maxSlippageBps, "Slippage too high");
 
-        address[] memory twocatsPath = new address[](2);
-        twocatsPath[0] = wavax;
-        twocatsPath[1] = address(twocatsToken);
-        uint256 twocatsTokenMin = pangolinRouter.getAmountsOut(avaxPerLiquidity, twocatsPath)[1] * liquiditySlippageBps / 10000;
-
-        try pangolinRouter.addLiquidityAVAX{value: avaxPerLiquidity}(
-            address(twocatsToken),
-            twocatsBalance,
-            twocatsTokenMin,
-            avaxMin,
-            address(this),
-            block.timestamp + 1200
-        ) returns (uint, uint, uint liquidity1) {
-            address twocatsLP = factory.getPair(address(twocatsToken), wavax);
-            acceptedLPs[twocatsLP] = true;
-            emit LiquidityAdded(twocatsLP, address(twocatsToken), liquidity1, "Pangolin");
-        } catch {
-            revert("TWOCATS LP creation failed");
-        }
-
-        address[] memory gerzaPath = new address[](2);
-        gerzaPath[0] = wavax;
-        gerzaPath[1] = address(gerzaToken);
-        uint256 gerzaTokenMin = pangolinRouter.getAmountsOut(avaxPerLiquidity, gerzaPath)[1] * liquiditySlippageBps / 10000;
-
-        try pangolinRouter.addLiquidityAVAX{value: avaxPerLiquidity}(
-            address(gerzaToken),
-            gerzaBalance,
-            gerzaTokenMin,
-            avaxMin,
-            address(this),
-            block.timestamp + 1200
-        ) returns (uint, uint, uint liquidity2) {
-            address gerzaLP = factory.getPair(address(gerzaToken), wavax);
-            acceptedLPs[gerzaLP] = true;
-            emit LiquidityAdded(gerzaLP, address(gerzaToken), liquidity2, "Pangolin");
-        } catch {
-            revert("GERZA LP creation failed");
-        }
+        uint256 amountOut = (amountIn * 1e18) / execPrice;
+        emit SwapExecuted(token, amountIn, amountOut, execPrice, slippage);
+        emit LiquidityStaged(token, amountIn, amountOut, execPrice, slippage);
     }
 }

@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "es2019",
+    "module": "commonjs",
+    "esModuleInterop": true,
+    "strict": false,
+    "types": [
+      "node",
+      "mocha",
+      "chai",
+      "hardhat",
+      "@nomiclabs/hardhat-ethers",
+      "@nomiclabs/hardhat-waffle"
+    ]
+  },
+  "include": ["./test", "./scripts"]
+}

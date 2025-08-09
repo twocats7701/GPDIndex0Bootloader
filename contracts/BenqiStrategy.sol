@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "./GPDYieldVault0.sol";
 
 interface IQiToken {
@@ -28,7 +29,7 @@ interface IUniswapV2Router {
     ) external returns (uint256[] memory amounts);
 }
 
-contract BenqiStrategy is Ownable, IYieldStrategy {
+contract BenqiStrategy is Ownable, ReentrancyGuard, IYieldStrategy {
     using SafeERC20 for IERC20;
 
     IERC20 public immutable underlying;
@@ -43,6 +44,8 @@ contract BenqiStrategy is Ownable, IYieldStrategy {
     /// @notice Global slippage tolerance in basis points for reward swaps
     /// @dev Defaults to 50 bps (0.5%) and can be overridden per call
     uint256 public slippageBps = 50;
+
+    event EmergencyWithdraw(uint256 underlyingAmount, uint256 rewardAmount);
 
     constructor(
         address _underlying,
@@ -74,16 +77,26 @@ contract BenqiStrategy is Ownable, IYieldStrategy {
     /// @notice Update the slippage tolerance in basis points
     /// @param newBps The new slippage amount where 100 bps = 1%
     function setSlippageBps(uint256 newBps) external onlyOwner {
+        require(newBps > 0, "bps too low");
+        require(newBps <= 10_000, "bps too high");
         slippageBps = newBps;
     }
 
-    function deposit(uint256 amount) external onlyVault {
+    function _deposit(uint256 amount) internal {
         underlying.safeTransferFrom(msg.sender, address(this), amount);
         require(qiToken.mint(amount) == 0, "Mint failed");
         totalSupplied += amount;
     }
 
-    function withdraw(uint256 amount) external onlyVault {
+    function deposit(uint256 amount) external onlyVault nonReentrant {
+        _deposit(amount);
+    }
+
+    function deposit(uint256 amount, uint256 /*slippageBpsOverride*/) external onlyVault nonReentrant {
+        _deposit(amount);
+    }
+
+    function _withdraw(uint256 amount) internal {
         require(qiToken.redeemUnderlying(amount) == 0, "Redeem failed");
         underlying.safeTransfer(vault, amount);
         if (totalSupplied >= amount) {
@@ -93,13 +106,21 @@ contract BenqiStrategy is Ownable, IYieldStrategy {
         }
     }
 
+    function withdraw(uint256 amount) external onlyVault nonReentrant {
+        _withdraw(amount);
+    }
+
+    function withdraw(uint256 amount, uint256 /*slippageBpsOverride*/) external onlyVault nonReentrant {
+        _withdraw(amount);
+    }
+
     function totalAssets() external view returns (uint256) {
         uint256 cBalance = qiToken.balanceOf(address(this));
         uint256 exchangeRate = qiToken.exchangeRateStored();
         return (cBalance * exchangeRate) / 1e18;
     }
 
-    function harvest(uint256 slippageBpsOverride) external onlyVault returns (uint256) {
+    function harvest(uint256 slippageBpsOverride) external onlyVault nonReentrant returns (uint256) {
         address[] memory qiTokens = new address[](1);
         qiTokens[0] = address(qiToken);
         controller.claimReward(0, address(this), qiTokens);
@@ -122,6 +143,29 @@ contract BenqiStrategy is Ownable, IYieldStrategy {
         );
 
         return amounts[amounts.length - 1];
+    }
+
+    /// @notice Withdraw all funds back to the vault without swapping rewards
+    function emergencyWithdraw() external onlyOwner nonReentrant {
+        uint256 cBalance = qiToken.balanceOf(address(this));
+        uint256 underlyingBal;
+        if (cBalance > 0) {
+            uint256 exchangeRate = qiToken.exchangeRateStored();
+            uint256 expected = (cBalance * exchangeRate) / 1e18;
+            require(qiToken.redeemUnderlying(expected) == 0, "Redeem failed");
+            underlyingBal = underlying.balanceOf(address(this));
+            if (underlyingBal > 0) {
+                underlying.safeTransfer(vault, underlyingBal);
+            }
+        }
+
+        uint256 rewardBal = rewardToken.balanceOf(address(this));
+        if (rewardBal > 0) {
+            rewardToken.safeTransfer(vault, rewardBal);
+        }
+
+        totalSupplied = 0;
+        emit EmergencyWithdraw(underlyingBal, rewardBal);
     }
 }
 

@@ -4,7 +4,6 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "./GPDYieldVault0.sol";
 
 interface IMasterChef {
@@ -25,11 +24,10 @@ interface IRouter {
     ) external returns (uint[] memory amounts);
 }
 
-/**
- * @title GPDIndex0LpStrategy
- * @dev Stakes LP tokens in a farm, harvests rewards, and converts them back to LP tokens.
- */
-contract GPDIndex0LpStrategy is Ownable, ReentrancyGuard, IYieldStrategy {
+/// @title VaporDexStrategy
+/// @notice Stakes LP tokens in a Vapor Dex farm and compounds the rewards back into LP tokens
+/// @dev Compatible with other Uniswap V2 style DEXs such as Pangolin by supplying appropriate addresses
+contract VaporDexStrategy is Ownable, IYieldStrategy {
     using SafeERC20 for IERC20;
 
     IERC20 public immutable lpToken;
@@ -38,12 +36,13 @@ contract GPDIndex0LpStrategy is Ownable, ReentrancyGuard, IYieldStrategy {
     IRouter public router;
     address public vault;
     uint256 public immutable pid;
+
     /// @notice Global slippage tolerance in basis points used for DEX operations
     /// @dev Defaults to 50 bps (0.5%) and can be overridden per call
     uint256 public slippageBps = 50;
-    /// @notice Swap path used to convert reward tokens into LP tokens
-    address[] public rewardToLpPath;
 
+    event VaultUpdated(address indexed newVault);
+    event SlippageBpsUpdated(uint256 newSlippageBps);
     event EmergencyWithdraw(uint256 lpAmount, uint256 rewardAmount);
 
     constructor(
@@ -61,9 +60,6 @@ contract GPDIndex0LpStrategy is Ownable, ReentrancyGuard, IYieldStrategy {
 
         lpToken.safeApprove(_farm, type(uint256).max);
         rewardToken.safeApprove(_router, type(uint256).max);
-
-        rewardToLpPath.push(address(rewardToken));
-        rewardToLpPath.push(address(lpToken));
     }
 
     modifier onlyVault() {
@@ -73,59 +69,39 @@ contract GPDIndex0LpStrategy is Ownable, ReentrancyGuard, IYieldStrategy {
 
     function setVault(address _vault) external onlyOwner {
         vault = _vault;
+        emit VaultUpdated(_vault);
     }
 
     /// @notice Update the slippage tolerance in basis points
     /// @param newBps The new slippage amount where 100 bps = 1%
     function setSlippageBps(uint256 newBps) external onlyOwner {
-        require(newBps > 0, "bps too low");
-        require(newBps <= 10_000, "bps too high");
         slippageBps = newBps;
+        emit SlippageBpsUpdated(newBps);
     }
 
-    /// @notice Update the swap path from reward token to LP token
-    /// @param path The new swap path
-    function setRewardToLpPath(address[] calldata path) external onlyOwner {
-        require(path.length >= 2, "Path too short");
-        require(path[0] == address(rewardToken), "Path must start with reward token");
-        require(path[path.length - 1] == address(lpToken), "Path must end with LP token");
-        rewardToLpPath = path;
-    }
-
-
-    /// @dev Pull LP tokens from the vault and stake them in the farm
     function _deposit(uint256 amount) internal {
         lpToken.safeTransferFrom(msg.sender, address(this), amount);
         farm.deposit(pid, amount);
     }
 
-    function deposit(uint256 amount) external onlyVault nonReentrant {
-        _deposit(amount);
+    function deposit(uint256 amount) external onlyVault {
+        deposit(amount, 0);
     }
 
-
-    /// @notice Deposit with an optional slippage override
-    /// @param amount Amount of LP tokens to deposit
-    /// @param /*slippageBpsOverride*/ Unused for now but reserved for future DEX conversions
-    function deposit(uint256 amount, uint256 /*slippageBpsOverride*/ ) public onlyVault nonReentrant {
+    function deposit(uint256 amount, uint256 /*slippageBpsOverride*/) public onlyVault {
         _deposit(amount);
     }
-
 
     function _withdraw(uint256 amount) internal {
         farm.withdraw(pid, amount);
         lpToken.safeTransfer(vault, amount);
     }
 
-    function withdraw(uint256 amount) external onlyVault nonReentrant {
-        _withdraw(amount);
+    function withdraw(uint256 amount) external onlyVault {
+        withdraw(amount, 0);
     }
 
-
-    /// @notice Withdraw with an optional slippage override
-    /// @param amount Amount of LP tokens to withdraw
-    /// @param /*slippageBpsOverride*/ Unused for now but reserved for future DEX conversions
-    function withdraw(uint256 amount, uint256 /*slippageBpsOverride*/ ) public onlyVault nonReentrant {
+    function withdraw(uint256 amount, uint256 /*slippageBpsOverride*/) public onlyVault {
         _withdraw(amount);
     }
 
@@ -133,8 +109,10 @@ contract GPDIndex0LpStrategy is Ownable, ReentrancyGuard, IYieldStrategy {
         (uint256 staked, ) = farm.userInfo(pid, address(this));
         uint256 pending = farm.pendingReward(pid, address(this));
 
-        if (pending > 0 && rewardToLpPath.length > 1) {
-            address[] memory path = rewardToLpPath;
+        if (pending > 0 && address(rewardToken) != address(lpToken)) {
+            address[] memory path = new address[](2);
+            path[0] = address(rewardToken);
+            path[1] = address(lpToken);
             uint[] memory amounts = router.getAmountsOut(pending, path);
             pending = amounts[amounts.length - 1];
         }
@@ -142,13 +120,15 @@ contract GPDIndex0LpStrategy is Ownable, ReentrancyGuard, IYieldStrategy {
         return staked + pending;
     }
 
-    function harvest(uint256 slippageBpsOverride) external onlyVault nonReentrant returns (uint256) {
+    function harvest(uint256 slippageBpsOverride) external onlyVault returns (uint256) {
         uint256 beforeBal = lpToken.balanceOf(address(this));
         farm.withdraw(pid, 0);
 
         uint256 rewardBal = rewardToken.balanceOf(address(this));
-        if (rewardBal > 0 && rewardToLpPath.length > 1) {
-            address[] memory path = rewardToLpPath;
+        if (rewardBal > 0 && address(rewardToken) != address(lpToken)) {
+            address[] memory path = new address[](2);
+            path[0] = address(rewardToken);
+            path[1] = address(lpToken);
             uint256[] memory amountsOut = router.getAmountsOut(rewardBal, path);
             uint256 expected = amountsOut[amountsOut.length - 1];
             uint256 bps = slippageBpsOverride == 0 ? slippageBps : slippageBpsOverride;
@@ -164,12 +144,12 @@ contract GPDIndex0LpStrategy is Ownable, ReentrancyGuard, IYieldStrategy {
     }
 
     /// @notice Withdraw all staked LP and rewards back to the vault
-    function emergencyWithdraw() external onlyOwner nonReentrant {
+    function emergencyWithdraw() external onlyOwner {
         (uint256 staked, ) = farm.userInfo(pid, address(this));
         if (staked > 0) {
             farm.withdraw(pid, staked);
         }
-        // claim any pending rewards
+        // claim pending rewards
         farm.withdraw(pid, 0);
 
         uint256 lpBal = lpToken.balanceOf(address(this));
