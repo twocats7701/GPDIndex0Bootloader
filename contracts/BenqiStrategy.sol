@@ -6,6 +6,7 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "./GPDYieldVault0.sol";
+import "./interfaces/IDexSwapRoute.sol";
 
 interface IQiToken {
     function mint(uint256 mintAmount) external returns (uint256);
@@ -18,17 +19,6 @@ interface IQiController {
     function claimReward(uint8 rewardType, address holder, address[] calldata qiTokens) external;
 }
 
-interface IUniswapV2Router {
-    function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts);
-    function swapExactTokensForTokens(
-        uint256 amountIn,
-        uint256 amountOutMin,
-        address[] calldata path,
-        address to,
-        uint256 deadline
-    ) external returns (uint256[] memory amounts);
-}
-
 contract BenqiStrategy is Ownable, ReentrancyGuard, IYieldStrategy {
     using SafeERC20 for IERC20;
 
@@ -36,7 +26,7 @@ contract BenqiStrategy is Ownable, ReentrancyGuard, IYieldStrategy {
     IERC20 public immutable rewardToken; // QI
     IQiToken public immutable qiToken;
     IQiController public immutable controller;
-    IUniswapV2Router public immutable router;
+    IDexSwapRoute public immutable swapRoute;
 
     address public vault;
     uint256 public totalSupplied;
@@ -51,18 +41,18 @@ contract BenqiStrategy is Ownable, ReentrancyGuard, IYieldStrategy {
         address _underlying,
         address _qiToken,
         address _controller,
-        address _router,
+        address _swapRoute,
         address[] memory _path
     ) {
         underlying = IERC20(_underlying);
         qiToken = IQiToken(_qiToken);
         controller = IQiController(_controller);
-        router = IUniswapV2Router(_router);
+        swapRoute = IDexSwapRoute(_swapRoute);
         rewardToUnderlyingPath = _path;
         rewardToken = IERC20(_path[0]);
 
         IERC20(_underlying).safeApprove(_qiToken, type(uint256).max);
-        IERC20(_path[0]).safeApprove(_router, type(uint256).max);
+        IERC20(_path[0]).safeApprove(_swapRoute, type(uint256).max);
     }
 
     modifier onlyVault() {
@@ -129,20 +119,10 @@ contract BenqiStrategy is Ownable, ReentrancyGuard, IYieldStrategy {
         if (rewardBal == 0) {
             return 0;
         }
-        uint256[] memory quote = router.getAmountsOut(rewardBal, rewardToUnderlyingPath);
-        uint256 expected = quote[quote.length - 1];
+        uint256 expected = swapRoute.getBestQuote(rewardToUnderlyingPath, rewardBal);
         uint256 bps = slippageBpsOverride == 0 ? slippageBps : slippageBpsOverride;
         uint256 minOut = (expected * (10_000 - bps)) / 10_000;
-
-        uint256[] memory amounts = router.swapExactTokensForTokens(
-            rewardBal,
-            minOut,
-            rewardToUnderlyingPath,
-            vault,
-            block.timestamp
-        );
-
-        return amounts[amounts.length - 1];
+        return swapRoute.swap(rewardToUnderlyingPath, rewardBal, minOut, vault);
     }
 
     /// @notice Withdraw all funds back to the vault without swapping rewards

@@ -7,6 +7,7 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/governance/TimelockController.sol";
 import "./GPDIndex0EmissionSchedule.sol";
+import "./AssetPolicy.sol";
 
 interface IPriceOracle {
     function getPrice() external view returns (uint256);
@@ -22,6 +23,12 @@ interface IRouter {
         address to,
         uint deadline
     ) external payable returns (uint amountToken, uint amountAVAX, uint liquidity);
+    function swapExactAVAXForTokens(
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external payable returns (uint[] memory amounts);
     function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts);
 }
 
@@ -50,7 +57,7 @@ contract GPDIndex0Bootloader is ReentrancyGuard, Ownable {
     event LPWhitelisted(address lpToken);
     event LPUnwhitelisted(address lpToken);
     event BasedChadActivated(address activator);
-    event FundsWithdrawn(address indexed token, uint256 amount);
+    event FundsSentToTreasury(address indexed token, uint256 amount, uint256 reasonCode);
     event DepositProcessed(address indexed from, uint256 amount, uint256 invested);
     event ReserveUpdated(uint256 liquidReserve, uint256 investedReserve);
     event SwapExecuted(
@@ -78,6 +85,7 @@ contract GPDIndex0Bootloader is ReentrancyGuard, Ownable {
     IRouter public pangolinRouter;
     IRouter public traderJoeRouter;
     IFactory public factory;
+    AssetPolicy public assetPolicy;
 
     uint256 public emissionsPerEpoch;
     uint256 public constant EPOCH_DURATION = 30 days;
@@ -88,6 +96,7 @@ contract GPDIndex0Bootloader is ReentrancyGuard, Ownable {
 
     TimelockController public timelock;
     address public governance;
+    address public treasury;
     bool public decentralizationInitiated = false;
 
     uint256 public constant BASED_CHAD_START = 1754611201; // 08 Aug 2025 00:00:01 GMT
@@ -166,6 +175,11 @@ contract GPDIndex0Bootloader is ReentrancyGuard, Ownable {
         pangolinRouter = IRouter(_pangolin);
         traderJoeRouter = IRouter(_traderJoe);
         factory = IFactory(_factory);
+    }
+
+    /// @notice Set the asset policy contract
+    function setAssetPolicy(address policy) external onlyGovernance {
+        assetPolicy = AssetPolicy(policy);
     }
 
     /// @notice Set number of tokens emitted per epoch
@@ -323,28 +337,39 @@ contract GPDIndex0Bootloader is ReentrancyGuard, Ownable {
         emit LPUnwhitelisted(lp);
     }
 
+    /// @notice Set the treasury contract that will hold protocol funds
+    /// @param _treasury Address of the treasury contract
+    function setTreasury(address _treasury) external onlyGovernance {
+        require(_treasury != address(0), "Treasury address cannot be zero");
+        treasury = _treasury;
+    }
+
     /// @notice Withdraw AVAX from the contract to the owner
     /// @param amount Amount of AVAX to withdraw
-    function withdrawAVAX(uint256 amount) external onlyGovernance nonReentrant {
+    /// @param reasonCode Code describing the reason for withdrawal
+    function withdrawAVAX(uint256 amount, uint256 reasonCode) external onlyGovernance nonReentrant {
         require(amount > 0, "Amount must be greater than zero");
         require(address(this).balance >= amount, "Insufficient AVAX balance");
+        require(treasury != address(0), "Treasury not set");
 
-        (bool success, ) = owner().call{value: amount}("");
+        (bool success, ) = treasury.call{value: amount}("");
         require(success, "AVAX transfer failed");
 
-        emit FundsWithdrawn(address(0), amount);
+        emit FundsSentToTreasury(address(0), amount, reasonCode);
     }
 
     /// @notice Withdraw an arbitrary ERC20 token to the owner
     /// @param token Token address to withdraw
     /// @param amount Amount of tokens to send
-    function withdrawToken(address token, uint256 amount) external onlyGovernance nonReentrant {
+    /// @param reasonCode Code describing the reason for withdrawal
+    function withdrawToken(address token, uint256 amount, uint256 reasonCode) external onlyGovernance nonReentrant {
         require(token != address(0), "Token address cannot be zero");
         require(amount > 0, "Amount must be greater than zero");
+        require(treasury != address(0), "Treasury not set");
 
-        IERC20(token).safeTransfer(owner(), amount);
+        IERC20(token).safeTransfer(treasury, amount);
 
-        emit FundsWithdrawn(token, amount);
+        emit FundsSentToTreasury(token, amount, reasonCode);
     }
 
     /// @notice Anyone can activate the based chad mode once the timestamp is reached
@@ -393,33 +418,86 @@ contract GPDIndex0Bootloader is ReentrancyGuard, Ownable {
         investedReserve += amount;
 
         if (address(twocatsToken) != address(0)) {
-            _executeSwap(address(twocatsToken), amount);
+            uint256 spent = _executeSwap(address(twocatsToken), amount);
+            if (spent < amount) {
+                uint256 refund = amount - spent;
+                liquidReserve += refund;
+                investedReserve -= refund;
+            }
         }
 
         emit ReserveUpdated(liquidReserve, investedReserve);
     }
 
-    function _executeSwap(address token, uint256 amountIn) internal {
+    function _executeSwap(address token, uint256 amountIn) internal returns (uint256 avaxSpent) {
         require(!circuitBreakers[token], "Circuit breaker active");
+        require(address(pangolinRouter) != address(0), "Router not set");
+
+        uint256 half = amountIn / 2;
+        (uint256 expectedOut, uint256 marketPrice) = _quote(token, half);
+        avaxSpent = _swapAndAddLiquidity(token, half, expectedOut, marketPrice);
+    }
+
+    function _quote(address token, uint256 amount) internal view returns (uint256 expectedOut, uint256 marketPrice) {
         address oracle = priceOracles[token];
         require(oracle != address(0), "Oracle not set");
+        address[] memory path = new address[](2);
+        path[0] = pangolinRouter.WAVAX();
+        path[1] = token;
+        expectedOut = pangolinRouter.getAmountsOut(amount, path)[1];
         uint256 oraclePrice = IPriceOracle(oracle).getPrice();
-        uint256 marketPrice = marketPrices[token];
-        uint256 execPrice = executionPrices[token];
-        require(marketPrice > 0 && execPrice > 0, "Prices not set");
-
+        marketPrice = (amount * 1e18) / expectedOut;
         uint256 priceImpact = marketPrice > oraclePrice
             ? (marketPrice - oraclePrice) * 10000 / oraclePrice
             : (oraclePrice - marketPrice) * 10000 / oraclePrice;
         require(priceImpact <= maxPriceImpactBps, "Price impact too high");
+    }
 
+    function _swapAndAddLiquidity(
+        address token,
+        uint256 half,
+        uint256 expectedOut,
+        uint256 marketPrice
+    ) internal returns (uint256 avaxSpent) {
+        if (address(assetPolicy) != address(0)) {
+            address wavax = pangolinRouter.WAVAX();
+            uint256 price = (expectedOut * 1e18) / half;
+            require(assetPolicy.allowedRouters(wavax, address(pangolinRouter)), "ROUTER_NOT_ALLOWED");
+            require(assetPolicy.isDexSellAllowed(wavax, price), "SELL_NOT_ALLOWED");
+        }
+        uint256 amountOut = pangolinRouter.swapExactAVAXForTokens{value: half}(
+            0,
+            _buildPath(token),
+            address(this),
+            block.timestamp
+        )[1];
+
+        uint256 execPrice = (half * 1e18) / amountOut;
         uint256 slippage = execPrice > marketPrice
             ? (execPrice - marketPrice) * 10000 / marketPrice
             : (marketPrice - execPrice) * 10000 / marketPrice;
         require(slippage <= maxSlippageBps, "Slippage too high");
 
-        uint256 amountOut = (amountIn * 1e18) / execPrice;
-        emit SwapExecuted(token, amountIn, amountOut, execPrice, slippage);
-        emit LiquidityStaged(token, amountIn, amountOut, execPrice, slippage);
+        IERC20(token).safeApprove(address(pangolinRouter), 0);
+        IERC20(token).safeApprove(address(pangolinRouter), amountOut);
+        (uint256 usedToken, uint256 usedAVAX, ) = pangolinRouter.addLiquidityAVAX{value: half}(
+            token,
+            amountOut,
+            (amountOut * (10000 - maxSlippageBps)) / 10000,
+            (half * (10000 - maxSlippageBps)) / 10000,
+            address(this),
+            block.timestamp
+        );
+
+        avaxSpent = half + usedAVAX;
+
+        emit SwapExecuted(token, half, amountOut, execPrice, slippage);
+        emit LiquidityStaged(token, usedAVAX, usedToken, execPrice, slippage);
+    }
+
+    function _buildPath(address token) internal view returns (address[] memory path) {
+        path = new address[](2);
+        path[0] = pangolinRouter.WAVAX();
+        path[1] = token;
     }
 }

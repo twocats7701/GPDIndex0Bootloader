@@ -5,6 +5,7 @@ import "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "./libraries/SafeOpsRestrictedToken.sol";
 
 interface IYieldStrategy {
     function deposit(uint256 amount) external;
@@ -30,6 +31,7 @@ interface ITipVault {
  */
 contract GPDYieldVault0 is ERC4626, Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
+    using SafeOpsRestrictedToken for SafeOpsRestrictedToken.AssetConfig;
 
     IYieldStrategy public strategy;
     IKeeperSlasher public keeperSlasher;
@@ -47,10 +49,18 @@ contract GPDYieldVault0 is ERC4626, Ownable, ReentrancyGuard {
 
     bool public autoCompoundEnabled;
 
+
+    mapping(address => SafeOpsRestrictedToken.AssetConfig) public assetConfigs;
+    bool public emergencyMode;
+    address public approvedRebalancer;
+
+
     event DepositMade(address indexed user, uint256 amount, uint256 shares);
     event Withdrawn(address indexed user, uint256 amount, uint256 fee);
     event Compounded(uint256 harvested, uint256 fee);
     event FeeExemptionUpdated(address indexed user, bool isExempt);
+    event EmergencyWithdrawn(uint256 amount);
+    event RebalancerUpdated(address indexed previous, address indexed current);
 
     modifier onlyKeeper() {
         require(address(keeperSlasher) != address(0), "slasher not set");
@@ -74,6 +84,31 @@ contract GPDYieldVault0 is ERC4626, Ownable, ReentrancyGuard {
         gerza = IERC20(_gerza);
         pussy = IERC20(_pussy);
         devAddress = _dev;
+
+        SafeOpsRestrictedToken.AssetConfig storage cfg = assetConfigs[address(_asset)];
+        cfg.sellEnabled = true;
+        cfg.maxSlippageBps = 10000;
+        cfg.maxSize = type(uint256).max;
+        cfg.maxSlippageBpsWhenDisabled = 0;
+        cfg.maxSizeWhenDisabled = 0;
+    }
+
+    function setAssetConfig(
+        address token,
+        address router,
+        bool sellEnabled,
+        uint256 maxSlippageBps,
+        uint256 maxSize,
+        uint256 maxSlippageBpsWhenDisabled,
+        uint256 maxSizeWhenDisabled
+    ) external onlyOwner {
+        SafeOpsRestrictedToken.AssetConfig storage cfg = assetConfigs[token];
+        cfg.router = router;
+        cfg.sellEnabled = sellEnabled;
+        cfg.maxSlippageBps = maxSlippageBps;
+        cfg.maxSize = maxSize;
+        cfg.maxSlippageBpsWhenDisabled = maxSlippageBpsWhenDisabled;
+        cfg.maxSizeWhenDisabled = maxSizeWhenDisabled;
     }
 
     function setStrategy(address _strategy) external onlyOwner {
@@ -100,6 +135,11 @@ contract GPDYieldVault0 is ERC4626, Ownable, ReentrancyGuard {
         tipVault = ITipVault(_tipVault);
     }
 
+    function setApprovedRebalancer(address _rebalancer) external onlyOwner {
+        emit RebalancerUpdated(approvedRebalancer, _rebalancer);
+        approvedRebalancer = _rebalancer;
+    }
+
     /// @notice Rebalance funds between strategies via an external rebalancer contract
     /// @param rebalancer Address of the rebalancer contract to delegatecall
     /// @param fromStrategy Current strategy to withdraw from
@@ -116,6 +156,7 @@ contract GPDYieldVault0 is ERC4626, Ownable, ReentrancyGuard {
         uint256 toApr
     ) external onlyOwner {
         require(fromStrategy == address(strategy), "wrong from");
+        require(rebalancer == approvedRebalancer, "unapproved rebalancer");
 
         (bool success, ) = rebalancer.delegatecall(
             abi.encodeWithSignature(
@@ -142,6 +183,7 @@ contract GPDYieldVault0 is ERC4626, Ownable, ReentrancyGuard {
         nonReentrant
         returns (uint256 shares)
     {
+        require(!emergencyMode, "paused");
         shares = super.deposit(assets, receiver);
         if (autoCompoundEnabled) {
             _compound();
@@ -154,6 +196,7 @@ contract GPDYieldVault0 is ERC4626, Ownable, ReentrancyGuard {
         nonReentrant
         returns (uint256 shares)
     {
+        require(!emergencyMode, "paused");
         shares = super.withdraw(assets, receiver, owner);
         if (autoCompoundEnabled) {
             _compound();
@@ -162,14 +205,14 @@ contract GPDYieldVault0 is ERC4626, Ownable, ReentrancyGuard {
 
     function _deposit(address caller, address receiver, uint256 assets, uint256 shares) internal override {
         require(assets > 0, "Deposit must be > 0");
-        IERC20(asset()).safeTransferFrom(caller, address(this), assets);
+        SafeOpsRestrictedToken.safeTransferFrom(IERC20(asset()), caller, address(this), assets, assetConfigs[asset()]);
         strategy.deposit(assets);
         _mint(receiver, shares);
         depositTimestamps[receiver] = block.timestamp;
         emit DepositMade(receiver, assets, shares);
     }
 
-    function _withdraw(address caller, address receiver, address owner, uint256 assets, uint256 shares) internal override {
+    function _withdraw(address /*caller*/, address receiver, address owner, uint256 assets, uint256 shares) internal override {
         require(shares > 0, "Withdraw must be > 0");
 
         uint256 feeBps = feeExempt[owner] ? 0 : getWithdrawalFee(owner);
@@ -180,10 +223,10 @@ contract GPDYieldVault0 is ERC4626, Ownable, ReentrancyGuard {
         strategy.withdraw(assets);
 
         if (fee > 0) {
-            IERC20(asset()).safeTransfer(devAddress, fee);
+            SafeOpsRestrictedToken.safeTransfer(IERC20(asset()), devAddress, fee, assetConfigs[asset()]);
         }
 
-        IERC20(asset()).safeTransfer(receiver, amountAfterFee);
+        SafeOpsRestrictedToken.safeTransfer(IERC20(asset()), receiver, amountAfterFee, assetConfigs[asset()]);
         emit Withdrawn(receiver, assets, fee);
     }
 
@@ -199,6 +242,16 @@ contract GPDYieldVault0 is ERC4626, Ownable, ReentrancyGuard {
     function setFeeExempt(address user, bool isExempt) external onlyOwner {
         feeExempt[user] = isExempt;
         emit FeeExemptionUpdated(user, isExempt);
+    }
+
+    function emergencyWithdraw() external onlyOwner nonReentrant {
+        require(!emergencyMode, "already");
+        emergencyMode = true;
+        uint256 balance = strategy.totalAssets();
+        if (balance > 0) {
+            strategy.withdraw(balance);
+        }
+        emit EmergencyWithdrawn(balance);
     }
 
     function depositTWOCATS(uint256 amount) external onlyOwner {
@@ -228,7 +281,7 @@ contract GPDYieldVault0 is ERC4626, Ownable, ReentrancyGuard {
         uint256 harvested = strategy.harvest(0);
         if (harvested > 0) {
             uint256 fee = (harvested * PERFORMANCE_FEE_BPS) / 10000;
-            IERC20(asset()).safeTransfer(devAddress, fee);
+            SafeOpsRestrictedToken.safeTransfer(IERC20(asset()), devAddress, fee, assetConfigs[asset()]);
             strategy.deposit(harvested - fee);
             emit Compounded(harvested, fee);
         }

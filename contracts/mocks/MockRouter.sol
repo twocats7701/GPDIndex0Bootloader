@@ -23,9 +23,9 @@ contract MockRouter {
         uint amountIn,
         uint amountOutMin,
         address[] calldata path,
-        address to,
-        uint deadline
-    ) external returns (uint[] memory amounts) {
+        address /*to*/,
+        uint /*deadline*/
+    ) external view returns (uint[] memory amounts) {
         uint256 out = amountIn * swapRate / 1e18;
         require(out >= amountOutMin, "INSUFFICIENT_OUTPUT_AMOUNT");
         amounts = new uint[](path.length);

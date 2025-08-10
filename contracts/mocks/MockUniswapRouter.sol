@@ -13,6 +13,7 @@ contract MockUniswapRouter {
 
     uint256 public quoteRate = 1e18; // rate used for getAmountsOut
     uint256 public swapRate = 1e18;  // rate used for swap
+    bool public failGetAmountsOut;
 
     constructor(address _rewardToken, address _underlying) {
         rewardToken = IERC20(_rewardToken);
@@ -27,11 +28,18 @@ contract MockUniswapRouter {
         swapRate = rate;
     }
 
+    function setFailGetAmountsOut(bool shouldFail) external {
+        failGetAmountsOut = shouldFail;
+    }
+
     function getAmountsOut(uint256 amountIn, address[] calldata path)
         external
         view
         returns (uint256[] memory amounts)
     {
+        if (failGetAmountsOut) {
+            revert("MockUniswapRouter: getAmountsOut failed");
+        }
         amounts = new uint256[](path.length);
         amounts[0] = amountIn;
         for (uint256 i = 1; i < path.length; i++) {

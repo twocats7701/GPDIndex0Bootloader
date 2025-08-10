@@ -9,20 +9,10 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "./GPDYieldVault0.sol";
 import "./FlashLoanExecutor.sol";
 import "./interfaces/IAavePool.sol";
+import "./interfaces/IDexSwapRoute.sol";
 
 interface IRewardsController {
     function claimRewards(address[] calldata assets, uint256 amount, address to, address reward) external returns (uint256);
-}
-
-interface IUniswapV2Router {
-    function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts);
-    function swapExactTokensForTokens(
-        uint256 amountIn,
-        uint256 amountOutMin,
-        address[] calldata path,
-        address to,
-        uint256 deadline
-    ) external returns (uint256[] memory amounts);
 }
 
 interface IFlashLoanSimpleReceiver {
@@ -36,7 +26,7 @@ contract AaveV3Strategy is Ownable, ReentrancyGuard, IYieldStrategy, IFlashLoanS
     IERC20 public immutable rewardToken;
     IAavePool public immutable pool;
     IRewardsController public immutable rewardsController;
-    IUniswapV2Router public immutable router;
+    IDexSwapRoute public immutable swapRoute;
     FlashLoanExecutor public immutable executor;
 
     address public vault;
@@ -53,20 +43,20 @@ contract AaveV3Strategy is Ownable, ReentrancyGuard, IYieldStrategy, IFlashLoanS
         address _underlying,
         address _pool,
         address _rewardsController,
-        address _router,
+        address _swapRoute,
         address[] memory _path,
         address _executor
     ) {
         underlying = IERC20(_underlying);
         pool = IAavePool(_pool);
         rewardsController = IRewardsController(_rewardsController);
-        router = IUniswapV2Router(_router);
+        swapRoute = IDexSwapRoute(_swapRoute);
         rewardToken = IERC20(_path[0]);
         rewardToUnderlyingPath = _path;
         executor = FlashLoanExecutor(_executor);
 
         underlying.safeApprove(_pool, type(uint256).max);
-        rewardToken.safeApprove(_router, type(uint256).max);
+        rewardToken.safeApprove(_swapRoute, type(uint256).max);
     }
 
     function setVault(address _vault) external onlyOwner {
@@ -123,18 +113,10 @@ contract AaveV3Strategy is Ownable, ReentrancyGuard, IYieldStrategy, IFlashLoanS
         if (claimed == 0) {
             return 0;
         }
-        uint256[] memory quote = router.getAmountsOut(claimed, rewardToUnderlyingPath);
-        uint256 expected = quote[quote.length - 1];
+        uint256 expected = swapRoute.getBestQuote(rewardToUnderlyingPath, claimed);
         uint256 bps = slippageBpsOverride == 0 ? slippageBps : slippageBpsOverride;
         uint256 minOut = (expected * (10_000 - bps)) / 10_000;
-        uint256[] memory amounts = router.swapExactTokensForTokens(
-            claimed,
-            minOut,
-            rewardToUnderlyingPath,
-            vault,
-            block.timestamp
-        );
-        return amounts[amounts.length - 1];
+        return swapRoute.swap(rewardToUnderlyingPath, claimed, minOut, vault);
     }
 
     function leverage(uint256 amount) external onlyVault nonReentrant {

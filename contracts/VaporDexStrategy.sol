@@ -5,23 +5,14 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "./GPDYieldVault0.sol";
+import "./interfaces/IDexSwapRoute.sol";
+import "./OtcAdapterPASS.sol";
 
 interface IMasterChef {
     function deposit(uint256 pid, uint256 amount) external;
     function withdraw(uint256 pid, uint256 amount) external;
     function userInfo(uint256 pid, address user) external view returns (uint256 amount, uint256 rewardDebt);
     function pendingReward(uint256 pid, address user) external view returns (uint256);
-}
-
-interface IRouter {
-    function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts);
-    function swapExactTokensForTokens(
-        uint amountIn,
-        uint amountOutMin,
-        address[] calldata path,
-        address to,
-        uint deadline
-    ) external returns (uint[] memory amounts);
 }
 
 /// @title VaporDexStrategy
@@ -33,16 +24,21 @@ contract VaporDexStrategy is Ownable, IYieldStrategy {
     IERC20 public immutable lpToken;
     IERC20 public immutable rewardToken;
     IMasterChef public farm;
-    IRouter public router;
+    IDexSwapRoute public swapRoute;
+    OtcAdapterPASS public otcAdapter;
     address public vault;
     uint256 public immutable pid;
+    address[] public rewardToLpPath;
 
     /// @notice Global slippage tolerance in basis points used for DEX operations
     /// @dev Defaults to 50 bps (0.5%) and can be overridden per call
     uint256 public slippageBps = 50;
+    bool public isDexSellAllowed = true;
 
     event VaultUpdated(address indexed newVault);
     event SlippageBpsUpdated(uint256 newSlippageBps);
+    event DexSellAllowedUpdated(bool allowed);
+    event OtcAdapterUpdated(address indexed adapter);
     event EmergencyWithdraw(uint256 lpAmount, uint256 rewardAmount);
 
     constructor(
@@ -50,16 +46,21 @@ contract VaporDexStrategy is Ownable, IYieldStrategy {
         address _farm,
         uint256 _pid,
         address _rewardToken,
-        address _router
+        address _swapRoute,
+        address[] memory _path
     ) {
         lpToken = IERC20(_lpToken);
         farm = IMasterChef(_farm);
         pid = _pid;
         rewardToken = IERC20(_rewardToken);
-        router = IRouter(_router);
+        swapRoute = IDexSwapRoute(_swapRoute);
+        require(_path.length >= 2, "invalid path");
+        require(_path[0] == _rewardToken, "path start");
+        require(_path[_path.length - 1] == _lpToken, "path end");
+        rewardToLpPath = _path;
 
         lpToken.safeApprove(_farm, type(uint256).max);
-        rewardToken.safeApprove(_router, type(uint256).max);
+        rewardToken.safeApprove(_swapRoute, type(uint256).max);
     }
 
     modifier onlyVault() {
@@ -77,6 +78,16 @@ contract VaporDexStrategy is Ownable, IYieldStrategy {
     function setSlippageBps(uint256 newBps) external onlyOwner {
         slippageBps = newBps;
         emit SlippageBpsUpdated(newBps);
+    }
+
+    function setDexSellAllowed(bool allowed) external onlyOwner {
+        isDexSellAllowed = allowed;
+        emit DexSellAllowedUpdated(allowed);
+    }
+
+    function setOtcAdapter(address adapter) external onlyOwner {
+        otcAdapter = OtcAdapterPASS(adapter);
+        emit OtcAdapterUpdated(adapter);
     }
 
     function _deposit(uint256 amount) internal {
@@ -110,11 +121,7 @@ contract VaporDexStrategy is Ownable, IYieldStrategy {
         uint256 pending = farm.pendingReward(pid, address(this));
 
         if (pending > 0 && address(rewardToken) != address(lpToken)) {
-            address[] memory path = new address[](2);
-            path[0] = address(rewardToken);
-            path[1] = address(lpToken);
-            uint[] memory amounts = router.getAmountsOut(pending, path);
-            pending = amounts[amounts.length - 1];
+            pending = swapRoute.getBestQuote(rewardToLpPath, pending);
         }
 
         return staked + pending;
@@ -126,14 +133,18 @@ contract VaporDexStrategy is Ownable, IYieldStrategy {
 
         uint256 rewardBal = rewardToken.balanceOf(address(this));
         if (rewardBal > 0 && address(rewardToken) != address(lpToken)) {
-            address[] memory path = new address[](2);
-            path[0] = address(rewardToken);
-            path[1] = address(lpToken);
-            uint256[] memory amountsOut = router.getAmountsOut(rewardBal, path);
-            uint256 expected = amountsOut[amountsOut.length - 1];
+            uint256 expected;
             uint256 bps = slippageBpsOverride == 0 ? slippageBps : slippageBpsOverride;
-            uint256 amountOutMin = (expected * (10_000 - bps)) / 10_000;
-            router.swapExactTokensForTokens(rewardBal, amountOutMin, path, address(this), block.timestamp);
+            if (isDexSellAllowed) {
+                expected = swapRoute.getBestQuote(rewardToLpPath, rewardBal);
+                uint256 amountOutMin = (expected * (10_000 - bps)) / 10_000;
+                swapRoute.swap(rewardToLpPath, rewardBal, amountOutMin, address(this));
+            } else {
+                require(address(otcAdapter) != address(0), "otc not set");
+                expected = otcAdapter.quoteOTC(address(rewardToken), address(lpToken), rewardBal);
+                uint256 amountOutMin = (expected * (10_000 - bps)) / 10_000;
+                otcAdapter.swapOTC(address(rewardToken), address(lpToken), rewardBal, amountOutMin, address(this));
+            }
         }
 
         uint256 harvested = lpToken.balanceOf(address(this)) - beforeBal;

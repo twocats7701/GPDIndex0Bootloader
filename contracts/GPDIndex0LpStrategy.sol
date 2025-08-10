@@ -6,6 +6,7 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "./GPDYieldVault0.sol";
+import "./AssetPolicy.sol";
 
 interface IMasterChef {
     function deposit(uint256 pid, uint256 amount) external;
@@ -36,6 +37,7 @@ contract GPDIndex0LpStrategy is Ownable, ReentrancyGuard, IYieldStrategy {
     IERC20 public immutable rewardToken;
     IMasterChef public farm;
     IRouter public router;
+    AssetPolicy public assetPolicy;
     address public vault;
     uint256 public immutable pid;
     /// @notice Global slippage tolerance in basis points used for DEX operations
@@ -73,6 +75,11 @@ contract GPDIndex0LpStrategy is Ownable, ReentrancyGuard, IYieldStrategy {
 
     function setVault(address _vault) external onlyOwner {
         vault = _vault;
+    }
+
+    /// @notice Set the asset policy contract
+    function setAssetPolicy(address policy) external onlyOwner {
+        assetPolicy = AssetPolicy(policy);
     }
 
     /// @notice Update the slippage tolerance in basis points
@@ -153,6 +160,11 @@ contract GPDIndex0LpStrategy is Ownable, ReentrancyGuard, IYieldStrategy {
             uint256 expected = amountsOut[amountsOut.length - 1];
             uint256 bps = slippageBpsOverride == 0 ? slippageBps : slippageBpsOverride;
             uint256 amountOutMin = (expected * (10_000 - bps)) / 10_000;
+            if (address(assetPolicy) != address(0)) {
+                uint256 price = (expected * 1e18) / rewardBal;
+                require(assetPolicy.allowedRouters(address(rewardToken), address(router)), "ROUTER_NOT_ALLOWED");
+                require(assetPolicy.isDexSellAllowed(address(rewardToken), price), "SELL_NOT_ALLOWED");
+            }
             router.swapExactTokensForTokens(rewardBal, amountOutMin, path, address(this), block.timestamp);
         }
 
